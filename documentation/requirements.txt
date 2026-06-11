@@ -1,0 +1,3 @@
+datasets
+sentencepiece
+huggingface_hub

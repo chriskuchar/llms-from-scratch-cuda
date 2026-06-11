@@ -1,0 +1,24 @@
+# Build
+build/
+*/build/
+
+# Data (too large for git)
+data/*.bin
+*/data/*.bin
+
+# Checkpoints (too large for git)
+checkpoints/
+*/checkpoints/
+
+# Training logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
