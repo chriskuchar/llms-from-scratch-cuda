@@ -107,7 +107,7 @@ The math behind every component is derived and written up in [`documentation/`](
 
 ## Also By Me
 
-**[RFX-Fuse](https://github.com/chriskuchar/RFX-Fuse)** — GPU-accelerated Random Forests engine in CUDA/C++. Published on [PyPI](https://pypi.org/project/rfx-fuse/) and [arXiv](https://arxiv.org/html/2603.13234v1). Scales to 25M+ samples with GPU acceleration, QLoRA compression, and explainable similarity.
+**[RFX-Fuse](https://github.com/chriskuchar/RFX-Fuse)** — Breiman and Cutler's Random Forests Compressed as a Unified Learning and Similarity Engine. Extended with native explainable similarity Published on [PyPI](https://pypi.org/project/rfx-fuse/) and [arXiv](https://arxiv.org/html/2603.13234v1). Scales to 25M+ samples with GPU acceleration.
 
 ## License
 
