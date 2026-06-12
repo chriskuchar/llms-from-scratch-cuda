@@ -153,6 +153,11 @@ void Model::build(ModelConfig cfg, int B, int T) {
     dlogits    = acts.reserve(BT * V);
     dx_tmp     = acts.reserve(BT * C);
 
+    // Gradient-checkpointing buffers: x_ckpt holds each layer's residual-stream input
+    // (saved in forward); backward recomputes per-layer activations from these.
+    CUDA_CHECK(cudaMalloc(&x_ckpt, (size_t)L * BT * C * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&x_mid, (size_t)BT * C * sizeof(float)));
+
     adam_m.allocate(n_params);
     adam_v.allocate(n_params);
 
@@ -226,6 +231,10 @@ void Model::forward(const int* input_ids, const int* targets, int B, int T) {
 
     for (int l = 0; l < L; l++) {
 
+        // Checkpoint this layer's input so backward can recompute its forward.
+        CUDA_CHECK(cudaMemcpy(x_ckpt + (size_t)l * BT * C, x,
+                              (size_t)BT * C * sizeof(float), cudaMemcpyDeviceToDevice));
+
         rmsnorm_forward(ln1_out, rrms1, x, rms1_w[l], config.norm_eps, BT, C);
 
 
@@ -284,7 +293,21 @@ void Model::backward(int B, int T) {
 
     rmsnorm_backward(dx, drmsf_w, dln_final, x, rmsf_w, rrms_final, BT, C);
 
+    // The single activation buffers only hold the last layer's values, so for each layer
+    // we recompute its forward from the checkpointed input x_ckpt[l], then run backward.
     for (int l = L - 1; l >= 0; l--) {
+        float* x_in = x_ckpt + (size_t)l * BT * C;   // this layer's residual-stream input
+
+        // Recompute layer l's forward activations.
+        rmsnorm_forward(ln1_out, rrms1, x_in, rms1_w[l], config.norm_eps, BT, C);
+        attention_forward(attn_out, q, k, v, att,
+            ln1_out, wq[l], wk[l], wv[l], wo[l],
+            B, T, C, nh, nkv, config.rope_theta, cublas_handle);
+        residual_forward(x_mid, x_in, attn_out, BT * C);   // x_mid = input to rms2
+        rmsnorm_forward(ln2_out, rrms2, x_mid, rms2_w[l], config.norm_eps, BT, C);
+        swiglu_forward(mlp_out, gate_buf, up_buf, hidden_buf,
+                       ln2_out, w_gate[l], w_up[l], w_down[l],
+                       BT, C, ff, cublas_handle);
 
         // MLP residual: both branches get a copy of dx.
         CUDA_CHECK(cudaMemcpy(dx_tmp, dx, BT * C * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -296,7 +319,7 @@ void Model::backward(int B, int T) {
                         w_gate[l], w_up[l], w_down[l],
                         BT, C, ff, cublas_handle);
 
-        rmsnorm_backward(dx_tmp, drms2_w[l], dln2_out, x, rms2_w[l], rrms2, BT, C);
+        rmsnorm_backward(dx_tmp, drms2_w[l], dln2_out, x_mid, rms2_w[l], rrms2, BT, C);  // input was x_mid
         residual_forward(dx, dx, dx_tmp, BT * C);   // dx += dx_tmp
 
         CUDA_CHECK(cudaMemcpy(dx_tmp, dx, BT * C * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -315,7 +338,7 @@ void Model::backward(int B, int T) {
                 wq[l], wk[l], wv[l], wo[l],
                 B, T, C, nh, nkv, config.rope_theta, cublas_handle);
         #endif
-        rmsnorm_backward(dx_tmp, drms1_w[l], dln1_out, x, rms1_w[l], rrms1, BT, C);
+        rmsnorm_backward(dx_tmp, drms1_w[l], dln1_out, x_in, rms1_w[l], rrms1, BT, C);  // input was x_in
         residual_forward(dx, dx, dx_tmp, BT * C);   // dx += dx_tmp
     }
 
@@ -350,6 +373,8 @@ void Model::free() {
     params.free();
     grads.free();
     acts.free();                            // free activation buffer
+    CUDA_CHECK(cudaFree(x_ckpt));            // free gradient-checkpoint buffers
+    CUDA_CHECK(cudaFree(x_mid));
     adam_m.free();                          // free first moment buffer
     adam_v.free();                          // free second moment buffer
 
@@ -479,6 +504,10 @@ void ModelBF16::build(ModelConfig cfg, int B, int T) {
     dlogits    = acts.reserve(BT * V);
     dx_tmp     = acts.reserve(BT * C);
 
+    // gradient-checkpointing buffers (bf16)
+    CUDA_CHECK(cudaMalloc(&x_ckpt, (size_t)L * BT * C * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&x_mid, (size_t)BT * C * sizeof(__nv_bfloat16)));
+
     // fp32 buffers for rrms and losses (small, need precision)
     CUDA_CHECK(cudaMalloc(&rrms1, BT * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&rrms2, BT * sizeof(float)));
@@ -562,6 +591,8 @@ void ModelBF16::forward(const int* input_ids, const int* targets, int B, int T) 
     embedding_forward(x, wte, input_ids, B, T, C);
 
     for (int l = 0; l < L; l++) {
+        CUDA_CHECK(cudaMemcpy(x_ckpt + (size_t)l * BT * C, x,
+                              (size_t)BT * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
         rmsnorm_forward(ln1_out, rrms1, x, rms1_w[l], config.norm_eps, BT, C);
         #ifdef USE_FLASH_ATTN
             attention_forward(attn_out, q, k, v, lse, ln1_out, wq[l], wv[l], wo[l],
@@ -605,6 +636,18 @@ void ModelBF16::backward(int B, int T) {
     rmsnorm_backward(dx, drmsf_w, dln_final, x, rmsf_w, rrms_final, BT, C);
 
     for (int l = L - 1; l >= 0; l--) {
+        __nv_bfloat16* x_in = x_ckpt + (size_t)l * BT * C;   // this layer's residual-stream input
+
+        // Recompute layer l's forward activations from the checkpoint.
+        rmsnorm_forward(ln1_out, rrms1, x_in, rms1_w[l], config.norm_eps, BT, C);
+        attention_forward(attn_out, q, k, v, att,
+            ln1_out, wq[l], wk[l], wv[l], wo[l],
+            B, T, C, nh, nkv, config.rope_theta, cublas_handle);
+        residual_forward(x_mid, x_in, attn_out, BT * C);
+        rmsnorm_forward(ln2_out, rrms2, x_mid, rms2_w[l], config.norm_eps, BT, C);
+        swiglu_forward(mlp_out, gate_buf, up_buf, hidden_buf,
+                       ln2_out, w_gate[l], w_up[l], w_down[l], BT, C, ff, cublas_handle);
+
         CUDA_CHECK(cudaMemcpy(dx_tmp, dx, BT * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemset(dmlp_out, 0, BT * C * sizeof(__nv_bfloat16)));
         residual_backward(dx, dmlp_out, dx_tmp, BT * C);
@@ -613,7 +656,7 @@ void ModelBF16::backward(int B, int T) {
                         dmlp_out, ln2_out, gate_buf, up_buf,
                         w_gate[l], w_up[l], w_down[l], BT, C, ff, cublas_handle);
 
-        rmsnorm_backward(dx_tmp, drms2_w[l], dln2_out, x, rms2_w[l], rrms2, BT, C);
+        rmsnorm_backward(dx_tmp, drms2_w[l], dln2_out, x_mid, rms2_w[l], rrms2, BT, C);  // input was x_mid
         residual_forward(dx, dx, dx_tmp, BT * C);
 
         CUDA_CHECK(cudaMemcpy(dx_tmp, dx, BT * C * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
@@ -632,7 +675,7 @@ void ModelBF16::backward(int B, int T) {
                 B, T, C, nh, nkv, config.rope_theta, cublas_handle);
         #endif
 
-        rmsnorm_backward(dx_tmp, drms1_w[l], dln1_out, x, rms1_w[l], rrms1, BT, C);
+        rmsnorm_backward(dx_tmp, drms1_w[l], dln1_out, x_in, rms1_w[l], rrms1, BT, C);  // input was x_in
         residual_forward(dx, dx, dx_tmp, BT * C);
     }
 }
@@ -676,6 +719,8 @@ void ModelBF16::free() {
     CUDA_CHECK(cudaFree(rrms_final));
     CUDA_CHECK(cudaFree(losses));
     CUDA_CHECK(cudaFree(dwte_fp32));
+    CUDA_CHECK(cudaFree(x_ckpt));
+    CUDA_CHECK(cudaFree(x_mid));
 
     delete[] rms1_w;  delete[] wq;     delete[] wk;
     delete[] wv;      delete[] wo;     delete[] rms2_w;

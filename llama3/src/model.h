@@ -41,6 +41,11 @@ struct Model {
     // --- Activations (intermediates for forward/backward) --- (acts.storage.data)
     ParameterBlock acts;
     float* x;           // [B*T, C]              main hidden state
+    // Gradient checkpointing: per-layer residual-stream input snapshot, so backward
+    // can recompute each layer's forward activations (the single scratch buffers below
+    // only ever hold the most recent layer's values).
+    float* x_ckpt;      // [n_layer, B*T, C]     input to each layer (saved in forward)
+    float* x_mid;       // [B*T, C]              scratch: x_in + attn_out (recomputed in backward)
     float* ln1_out;     // [B*T, C]              output of first RMSNorm
     float* rrms1;       // [B*T]                 reciprocal RMS (saved for backward)
     float* q;           // [B*T, C]              query projection output
@@ -132,6 +137,9 @@ struct ModelBF16 {
     // --- fp16 activations ---
     HalfParameterBlock acts;
     __nv_bfloat16* x;
+    // Gradient checkpointing buffers (see Model struct for rationale).
+    __nv_bfloat16* x_ckpt;   // [n_layer, B*T, C]  input to each layer (saved in forward)
+    __nv_bfloat16* x_mid;    // [B*T, C]           scratch: x_in + attn_out (recomputed in backward)
     __nv_bfloat16* ln1_out;
     float* rrms1;       // stays fp32 (one scalar per row)
     __nv_bfloat16* q;

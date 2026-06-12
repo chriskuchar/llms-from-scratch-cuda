@@ -13,7 +13,7 @@ The kernels are config-agnostic, so all models in this repo share **one** hand-w
 | Model | Style | What's notable | Status |
 |---|---|---|---|
 | [`llama2-mistral/`](llama2-mistral) | LLaMA 2 / Mistral | 125M params, GQA + RoPE + RMSNorm + SwiGLU, 32K SentencePiece vocab, fp16 mixed precision | **working, trains end-to-end** |
-| [`llama3/`](llama3) | LLaMA 3 | same block + 128K tokenizer, RoPE θ = 500,000, 8K context (~272M params) | **config-ready**, reuses shared kernels |
+| [`llama3/`](llama3) | LLaMA 3 | same block + 128K tokenizer, RoPE θ = 500,000, 8K context (~272M params) | **builds + passes overfit test**, reuses shared kernels |
 
 LLaMA 3 is intentionally a small diff from LLaMA 2 — same decoder block, just a bigger tokenizer, a higher RoPE base, and a longer context — which is why both build on the identical kernels in `cuda/`.
 
@@ -40,7 +40,7 @@ Most are small diffs (QKV bias, QK-norm, GeGLU, MoE routing); the standouts are 
 
 ### Initial result — LLaMA 2 (`llama2-mistral`) pretraining works
 
-A first bf16 pretraining run on a single **RTX 3060 (12GB)** confirms the model learns end-to-end. Trained on a **~10.1M-token** slice of Common Corpus (`data/pretrain_test.bin`). 124.7M params, bf16 mixed precision, B=4 × T=512 × accum=16 (effective batch 32,768 tokens/step), activation memory ~467 MB.
+A first bf16 pretraining run on a single **RTX 3060 (12GB)** confirms the model learns end-to-end. Trained on a **~10.1M-token** slice of Common Corpus. 124.7M params, bf16 mixed precision, B=4 × T=512 × accum=16 (effective batch 32,768 tokens/step), activation memory ~467 MB.
 
 ```
 step     1 | loss 10.50 | lr 1.5e-07 | 4452 tok/s
@@ -59,6 +59,37 @@ step  2000 | loss  7.26 | lr 3.0e-04
 - **Stable in bf16** — no divergence, thanks to fp32 master weights / Adam state and correct gradient accumulation (`beta=1` weight-grad accumulation across the 16 micro-batches).
 
 *(Smoke run on the ~10.1M-token slice — it sees several epochs, so it starts memorizing; full pretraining uses the 500M-token set. Numbers are illustrative of correctness + speed, not final model quality.)*
+
+### Correctness — single-batch overfit test
+
+The standard sanity check that backprop is implemented correctly: train on a **single fixed batch** and confirm the model can memorize it (loss → ~0). With orders of magnitude more parameters than tokens, a correct transformer drives loss to near zero in a few hundred steps; if it stalls, gradients are wrong somewhere.
+
+Make a one-batch dataset and run it:
+
+```bash
+cd llama2-mistral
+# One batch needs B*T + 1 tokens (the +1 is the next-token target shift).
+# The .bin is raw int32 tokens (4 bytes each), so at B=1, T=512:
+#   (1*512 + 1) tokens * 4 bytes = 2052 bytes
+head -c 2052 data/pretrain.bin > data/overfit.bin
+
+cd build
+./train ../data/overfit.bin --bf16 --batch 1 --steps 2000 \
+        --accum 1 --lr 3e-4 --warmup 20 --save 1000000
+```
+
+Expected output (loss collapses to ~0 — the model memorizes the batch):
+
+```
+step     1 | loss 10.5058 | lr 1.50e-05
+step    20 | loss  5.0903 | lr 3.00e-04
+step    30 | loss  1.3280 | lr 3.00e-04
+step    50 | loss  0.0596 | lr 3.00e-04
+step   100 | loss  0.0029 | lr 3.00e-04
+step   200 | loss  0.0001 | lr 3.00e-04
+```
+
+**Both models pass.** `llama2-mistral` (32K vocab) starts at ~10.5 and `llama3` (128K vocab) starts at ~11.8 (≈ ln of each vocab size); both collapse to ~0 within a few hundred steps. This confirms the full hand-written backward pass — attention/RoPE/RMSNorm/SwiGLU gradients, gradient accumulation, and per-layer activation checkpointing — is numerically correct end to end, across both configs and both precisions (`fp32` and `bf16` give the same curve — drop the `--bf16` flag to test the fp32 path).
 
 ### Planned
 
