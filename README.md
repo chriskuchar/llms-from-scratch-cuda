@@ -38,27 +38,29 @@ Most are small diffs (QKV bias, QK-norm, GeGLU, MoE routing); the standouts are 
 
 ## Benchmarks
 
-### Initial result — LLaMA 2 (`llama2-mistral`) pretraining works
+### Pretraining result — LLaMA 2 (`llama2-mistral`) learns end-to-end (loss 10.5 → ~4.0)
 
-A first bf16 pretraining run on a single **RTX 3060 (12GB)** confirms the model learns end-to-end. Trained on a **~10.1M-token** slice of Common Corpus. 124.7M params, bf16 mixed precision, B=4 × T=512 × accum=16 (effective batch 32,768 tokens/step), activation memory ~467 MB.
+A bf16 pretraining run on a single **RTX 3060 (12GB)** takes the model from random init into coherent-text territory. Trained on a **~298M-token** subset of **Common Corpus** (`PleIAs/common_corpus` — multilingual public-domain text: books, news, legal/encyclopedic passages, and OCR'd historical documents across English, French, Spanish, German, and more). 124.7M params, bf16 mixed precision, B=16 × T=512 × accum=16 (effective batch **131,072 tokens/step**), activation memory ~1.87 GB. Full log: [`llama2-mistral/results/pretrain_298m.log`](llama2-mistral/results/pretrain_298m.log).
 
 ```
-step     1 | loss 10.50 | lr 1.5e-07 | 4452 tok/s
-step   250 | loss  9.55 | lr 3.8e-05
-step   500 | loss  7.81 | lr 7.5e-05
-step   750 | loss  8.09 | lr 1.1e-04
-step  1000 | loss  6.70 | lr 1.5e-04
-step  1250 | loss  7.88 | lr 1.9e-04
-step  1500 | loss  7.12 | lr 2.3e-04
-step  1750 | loss  5.27 | lr 2.6e-04
-step  2000 | loss  7.26 | lr 3.0e-04
+step     1 | loss 10.50 | lr 1.5e-07    <- random init (≈ ln 32000)
+step  1000 | loss  5.35 | lr 1.5e-04
+step  2000 | loss  6.01 | lr 3.0e-04    <- LR warmup peak
+step  3000 | loss  4.74 | lr 3.0e-04
+step  4000 | loss  4.31 | lr 3.0e-04
+step  5000 | loss  4.55 | lr 2.9e-04
+step  6000 | loss  4.15 | lr 2.9e-04
+step  6370 | loss  4.26 | lr 2.8e-04
 ```
 
-- **Loss** falls from 10.50 (random init, ≈ ln 32000) into the **6–7 range by ~2,000 steps**, with the best micro-batches dipping to **~4.4–5.6**. Per-step loss is a single-micro-batch readout, so it's noisy; the trend is the signal.
-- **Throughput** holds steady around **~4,700 tok/s** on the consumer GPU.
-- **Stable in bf16** — no divergence, thanks to fp32 master weights / Adam state and correct gradient accumulation (`beta=1` weight-grad accumulation across the 16 micro-batches).
+- **Loss** falls from 10.50 (random init, ≈ ln 32000) to a **running average of ~4.0**. Per-step loss is a single-micro-batch readout, so it's noisy (best micro-batches dip to **~0.6–2.1** on low-entropy passages — boilerplate, repeated phrasing, predictable text); the running average is the signal.
+- **Throughput** holds steady around **~3,500 tok/s** at the larger B=16 effective batch on the consumer GPU.
+- **Stable in bf16** — no divergence across 6,000+ steps, thanks to fp32 master weights / Adam state and correct gradient accumulation (`beta=1` weight-grad accumulation across the 16 micro-batches).
+- **Checkpoint resume verified** — the run was resumed mid-schedule from a step-1300 checkpoint: both weights and the Adam `m`/`v` state were restored with **no loss spike**, and the LR schedule continued through warmup to the 3e-4 peak.
 
-*(Smoke run on the ~10.1M-token slice — it sees several epochs, so it starts memorizing; full pretraining uses the 500M-token set. Numbers are illustrative of correctness + speed, not final model quality.)*
+*(~298M tokens for 124.7M params is ~2.4× tokens/param — below Chinchilla-optimal — so by step 6370 the run has seen ~2.8 epochs and the average flattens near ~4.0; full language quality needs a larger token budget. Numbers demonstrate correctness, stability, and throughput, not final model quality.)*
+
+**Why ~4.0 (and why that's harder than it looks).** Cross-entropy loss is only comparable *within the same dataset and tokenizer* — a loss of 4.0 here is **not** worse than the ~1.5–2.5 a model of this size would reach on a toy corpus like TinyStories. Common Corpus is multilingual, mixed-register, OCR-noisy public-domain text, so its cross-entropy floor is simply much higher: the model is splitting 124.7M parameters across several languages and document types instead of memorizing one simple register. Driving loss from 10.50 → ~4.0 on data this varied is a *stronger* signal that the pipeline (attention, RoPE, optimizer, gradient accumulation, bf16 numerics) is learning real structure than the same drop on uniform children's-story prose would be. The trade-off: a small model on hard, noisy data won't emit fluent single-language text — for coherent generated samples you'd pretrain on something clean and narrow like TinyStories, which gives a lower, prettier number on an easier benchmark, not a better-engineered model.
 
 ### Correctness — single-batch overfit test
 
@@ -134,7 +136,7 @@ The math behind every component is derived and written up in [`documentation/`](
 
 - **[`algorithm_explanations/`](documentation/algorithm_explanations)** — how each block works (attention/GQA, RoPE, RMSNorm, SwiGLU, softmax, cross-entropy, embeddings, matmul, AdamW + LR warmup, KV cache, Flash Attention).
 - **[`backprop_explanations/`](documentation/backprop_explanations)** — gradient derivations for every kernel plus a full end-to-end backward pass.
-- **[`training_instructions/`](documentation/training_instructions)** — pretraining setup and a breakdown of every training parameter.
+- **[`training_instructions/`](documentation/training_instructions)** — pretraining setup, a breakdown of every training parameter, and a [data sources guide](documentation/training_instructions/data_sources.md) (what to pretrain/fine-tune on, where to find it, and how to tokenize it).
 
 ## Also By Me
 
